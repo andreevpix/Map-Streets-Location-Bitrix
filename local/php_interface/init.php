@@ -26,6 +26,18 @@ class Dadata
         curl_setopt(self::$handle, CURLOPT_POST, 1);
     }
 
+    public static function geolocate($lat, $lon, $count = 10, $radius_meters = 100)
+    {
+        $url = self::$base_url . "/geolocate/address";
+        $fields = array(
+            "lat" => $lat,
+            "lon" => $lon,
+            "count" => $count,
+            "radius_meters" => $radius_meters
+        );
+        return self::executeRequest($url, $fields);
+    }
+
     /**
      * See https://dadata.ru/api/suggest/ for details.
      */
@@ -51,6 +63,7 @@ class Dadata
         }
         $result = self::exec();
         $result = json_decode($result, true);
+
         return $result;
     }
 
@@ -66,57 +79,66 @@ class Dadata
         return $result;
     }
 }
-
 class AddHLBlockWithStreets extends Dadata
 {
-
     /**
-     * @var string
+     * @var float $geo_lat
+     * @var float $geo_lon
+     * @var int $count
+     * @var int $radius
+     * @var array $hlTable
+     * @var array $hlTableLang
      */
-    private static $query;
-    /**
-     * @var int
-     */
+    private static $geo_lat;
+    private static $geo_lon;
     private static $count;
-    /**
-     * @var array
-     */
-    private static $region;
-
-    public function __construct($token, string $query, int $count, array $region)
-    {
-        parent::__construct($token);
-        self::$query = $query;
-        self::$count = $count;
-        self::$region = $region;
-    }
-
+    private static $radius;
     private static $hlTable = [
         'NAME' => 'Streets',
         'TABLE_NAME' => 'a_hl_str_msc',
     ];
-
     private static $hlTableLang = [
         'ru' => 'Справочник: Улицы Москвы',
         'en' => 'Dictionary: Streets of Moscow'
     ];
 
-    public static function getStreets(string $query, int $count, array $region)
+    public function __construct($token, float $geo_lat, float $geo_lon, int $count = 10, int $radius = 100)
+    {
+        parent::__construct($token);
+        self::$geo_lat = $geo_lat;
+        self::$geo_lon = $geo_lon;
+        self::$count = $count;
+        self::$radius = $radius;
+    }
+
+    /**
+     * @param float $geo_lat
+     * @param float $geo_lon
+     * @param int $count
+     * @param int $radius
+     * @return array
+     */
+    public static function getStreets(float $geo_lat, float $geo_lon, int $count = 10, int $radius = 100)
     {
         Dadata::init();
 
         $hlRows = [];
-        $fields = array("query" => $query, "count" => $count, "locations" => [$region]);
-        $result = Dadata::suggest("party", $fields);
+
+        $result = self::geolocate($geo_lat, $geo_lon, $count, $radius);
 
         foreach ($result['suggestions'] as $key => $value) {
-            $hlRows[$key]['geoLatPosition'] = $value['data']['address']['data']['geo_lat'];
-            $hlRows[$key]['geoLonPosition'] = $value['data']['address']['data']['geo_lon'];
-            $hlRows[$key]['address'] = $value['data']['address']['data']['street_with_type']
-                . ', '
-                . $value['data']['address']['data']['house_type_full']
-                . ' '
-                . $value['data']['address']['data']['house'];
+            // 60.0001087
+            $geoLat = $value['data']['geo_lat'];
+            // 30.2562129
+            $geoLon = $value['data']['geo_lon'];
+            // ул Гаккелевская or Комсомольский пр-кт or Шелепихинская наб and etc.
+            $streetName = $value['unrestricted_value'];
+
+            if (!empty($streetName)) {
+                $hlRows[$key]['geoLatPosition'] = $geoLat;
+                $hlRows[$key]['geoLonPosition'] = $geoLon;
+                $hlRows[$key]['address'] = $streetName;
+            }
         }
         Dadata::close();
         return $hlRows;
@@ -144,23 +166,35 @@ class AddHLBlockWithStreets extends Dadata
             return $result;
         }
 
-        // создание hl блока
-        $addHlResult = self::addHlKnowledge();
-        if (!$addHlResult->isSuccess()) {
-            $result->addErrors($addHlResult->getErrors());
+        $hlTable = self::getKnowledgeHlTable();
+
+        if (empty($hlTable)) {
+            // создание hl блока
+            $addHlResult = self::addHlKnowledge();
+            if (!$addHlResult->isSuccess()) {
+                $result->addErrors($addHlResult->getErrors());
+            }
+
+            // добавлние пользовательских свойств
+            $addUserFieldsResult = self::addUserFields();
+            if (!$addUserFieldsResult->isSuccess()) {
+                $result->addErrors($addUserFieldsResult->getErrors());
+            }
+
+            // заполнение справочника
+            $fillUserFieldsResult = self::fillUserFields();
+            if (!$fillUserFieldsResult->isSuccess()) {
+                $result->addErrors($fillUserFieldsResult->getErrors());
+            }
+        } else {
+            // заполнение справочника
+            $fillUserFieldsResult = self::fillUserFields();
+            if (!$fillUserFieldsResult->isSuccess()) {
+                $result->addErrors($fillUserFieldsResult->getErrors());
+            }
         }
 
-        // добавлние пользовательских свойств
-        $addUserFieldsResult = self::addUserFields();
-        if (!$addUserFieldsResult->isSuccess()) {
-            $result->addErrors($addUserFieldsResult->getErrors());
-        }
 
-        // заполнение справочника
-        $fillUserFieldsResult = self::fillUserFields();
-        if (!$fillUserFieldsResult->isSuccess()) {
-            $result->addErrors($fillUserFieldsResult->getErrors());
-        }
 
         return $result;
     }
@@ -230,23 +264,42 @@ class AddHLBlockWithStreets extends Dadata
                         'en' => 'Name'
                     ],
                 ],
-                'UF_GEO' => [
+                'UF_GEO_LAT' => [
                     'ENTITY_ID' => "HLBLOCK_{$hlTable['ID']}",
-                    'FIELD_NAME' => 'UF_GEO',
+                    'FIELD_NAME' => 'UF_GEO_LAT',
                     'USER_TYPE_ID' => 'string',
                     'MULTIPLE' => 'N',
                     'MANDATORY' => 'N',
                     "EDIT_FORM_LABEL" => [
-                        'ru' => 'Геолокация',
-                        'en' => 'Geolocation'
+                        'ru' => 'Гео Lat',
+                        'en' => 'Geo Lat'
                     ],
                     "LIST_COLUMN_LABEL" => [
-                        'ru' => 'Геолокация',
-                        'en' => 'Geolocation'
+                        'ru' => 'Гео Lat',
+                        'en' => 'Geo Lat'
                     ],
                     "LIST_FILTER_LABEL" => [
-                        'ru' => 'Геолокация',
-                        'en' => 'Geolocation'
+                        'ru' => 'Гео Lat',
+                        'en' => 'Geo Lat'
+                    ],
+                ],
+                'UF_GEO_LON' => [
+                    'ENTITY_ID' => "HLBLOCK_{$hlTable['ID']}",
+                    'FIELD_NAME' => 'UF_GEO_LON',
+                    'USER_TYPE_ID' => 'string',
+                    'MULTIPLE' => 'N',
+                    'MANDATORY' => 'N',
+                    "EDIT_FORM_LABEL" => [
+                        'ru' => 'Гео Lon',
+                        'en' => 'Geo Lon'
+                    ],
+                    "LIST_COLUMN_LABEL" => [
+                        'ru' => 'Гео Lon',
+                        'en' => 'Geo Lon'
+                    ],
+                    "LIST_FILTER_LABEL" => [
+                        'ru' => 'Гео Lon',
+                        'en' => 'Geo Lon'
                     ],
                 ],
                 'UF_XML_ID' => [
@@ -299,34 +352,30 @@ class AddHLBlockWithStreets extends Dadata
     private static function fillUserFields(): \Bitrix\Main\Result
     {
         $result = new \Bitrix\Main\Result();
-        $hlRows = self::getStreets(self::$query, self::$count, self::$region);
+        $hlRows = self::getStreets(self::$geo_lat, self::$geo_lon, self::$count, self::$radius);
         $hlTable = self::getKnowledgeHlTable();
 
-        if (!empty($hlTable)) {
-            $entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlTable);
-            $knowledge = $entity->getDataClass();
 
-            // поиск имеющихся записей
-            $rsItems = $knowledge::getList();
-            $exItems = [];
-            while ($item = $rsItems->fetch()) {
-                $exItems[$item['UF_XML_ID']] = $item;
-            }
+        $entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlTable);
+        $knowledge = $entity->getDataClass();
 
-            // заполнение справочника
-            foreach ($hlRows as $hlRow) {
-                $xmlId = CUtil::translit($hlRow, 'ru');
+        global $DB;
+        $results = $DB->Query("DELETE FROM `a_hl_str_msc`");
+        while ($row = $results->Fetch()) {
+        }
 
-                if (empty($exItems[$xmlId])) {
-                    $res = $knowledge::add([
-                        "UF_NAME" => $hlRow['address'],
-                        "UF_GEO" => $hlRow['geoLatPosition'] . ', ' . $hlRow['geoLonPosition'],
-                        "UF_XML_ID" => $xmlId,
-                    ]);
-                    if (!$res->isSuccess()) {
-                        $result->addErrors($res->getErrors());
-                    }
-                }
+        // заполнение справочника
+        foreach ($hlRows as $hlRow) {
+            $xmlId = CUtil::translit($hlRow['address'], 'ru');
+
+            $res = $knowledge::add([
+                "UF_NAME" => $hlRow['address'],
+                "UF_GEO_LAT" => $hlRow['geoLatPosition'],
+                "UF_GEO_LON" => $hlRow['geoLonPosition'],
+                "UF_XML_ID" => $xmlId,
+            ]);
+            if (!$res->isSuccess()) {
+                $result->addErrors($res->getErrors());
             }
         }
 
